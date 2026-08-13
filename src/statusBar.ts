@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import { UsageData } from './dataService';
 import { calculatePacing, classifyStatus, generatePacerBar } from './pacing';
+import { getPacingOptionsFromConfig } from './pacingConfig';
 
 export function createStatusBarItem(): vscode.StatusBarItem {
   const item = vscode.window.createStatusBarItem(
@@ -27,7 +28,7 @@ function getStatusBarMode(): 'pacer' | 'classic' {
 
 export function updateStatusBar(item: vscode.StatusBarItem, data: UsageData, now: Date = new Date()): void {
   const { totalUsage, limit, remaining } = data;
-  const pacing = calculatePacing(totalUsage, limit, now, remaining);
+  const pacing = calculatePacing(totalUsage, limit, now, remaining, getPacingOptionsFromConfig());
   const status = classifyStatus(pacing);
   const mode = getStatusBarMode();
 
@@ -46,26 +47,33 @@ export function updateStatusBar(item: vscode.StatusBarItem, data: UsageData, now
     item.backgroundColor = undefined;
   }
 
-  // Rich tooltip (shared, includes remaining-today)
   const usedPct = ((totalUsage / limit) * 100).toFixed(1);
-  const targetPct = Math.round((pacing.dayOfMonth / pacing.daysInMonth) * 100);
+  const targetPct = (pacing.targetPercentage * 100).toFixed(1);
   const formattedPacingBanked = pacing.banked.toFixed(1);
   const bankedStr = pacing.banked >= 0
     ? `+${formattedPacingBanked} saved`
     : `${formattedPacingBanked} overspent`;
   const sourceLabel = data.dataSource === 'api' ? 'Live from API' : 'Manual data';
-  const remainTodayStr = pacing.remainingToday > 0
-    ? `~${Math.floor(pacing.remainingToday)} requests left today`
-    : `Over today's budget by ~${Math.abs(Math.floor(pacing.endOfTodayQuota - pacing.usedRequests))} requests`;
+  const isCalendar = pacing.pacingMode === 'calendar';
+  const pacingUnit = isCalendar ? 'day' : 'workday';
+  const remainTodayStr = !pacing.isWorkingDay
+    ? 'Non-working day · pacing budget paused'
+    : pacing.remainingToday > 0
+      ? `~${Math.floor(pacing.remainingToday)} requests left today`
+      : `Over today's budget by ~${Math.abs(Math.floor(pacing.endOfTodayQuota - pacing.usedRequests))} requests`;
 
   const tooltipLines = [
     `Copilot Premium: ${totalUsage} / ${limit} (${usedPct}%)`,
-    `Daily allowance: ${pacing.dailyAllowance.toFixed(1)} requests/day`,
+    `Target today: ${targetPct}%`,
+    `Base budget: ${pacing.baseDailyBudget.toFixed(1)} requests/${pacingUnit}`,
+    `Adjusted allowance: ${pacing.dailyAllowance.toFixed(1)} requests/${pacingUnit}`,
     remainTodayStr,
     ...(data.dailyUsage !== undefined ? [`Today's usage: ${data.dailyUsage}`] : []),
     `${bankedStr} vs expected`,
     `Projected: ~${pacing.projectedEnd.toFixed(1)} by month end`,
-    `Day ${pacing.dayOfMonth}/${pacing.daysInMonth} \u00b7 ${pacing.daysRemaining} days left`,
+    isCalendar
+      ? `Day ${pacing.dayOfMonth}/${pacing.daysInMonth} · ${pacing.daysRemaining} days left`
+      : `Workday ${pacing.pacingDay}/${pacing.pacingDaysInMonth} · ${pacing.daysRemaining} workdays left`,
     `Source: ${sourceLabel}`,
     `Actual vs target: ${usedPct}% used vs ${targetPct}% target`,
   ];
@@ -74,7 +82,7 @@ export function updateStatusBar(item: vscode.StatusBarItem, data: UsageData, now
     tooltipLines.push(`Quota resets: ${resetLabel}`);
   }
   if (pacing.overageCost > 0) {
-    tooltipLines.splice(3, 0, `\ud83d\udcb0 Overage: ${pacing.overageRequests} requests ($${pacing.overageCost.toFixed(2)})`);
+    tooltipLines.splice(5, 0, `💰 Overage: ${pacing.overageRequests} requests ($${pacing.overageCost.toFixed(2)})`);
   }
   item.tooltip = tooltipLines.join('\n');
 
@@ -90,6 +98,8 @@ function renderPacerMode(
 
   if (pacing.overageCost > 0) {
     item.text = `$(copilot) ${bar} $${pacing.overageCost.toFixed(2)} over`;
+  } else if (!pacing.isWorkingDay) {
+    item.text = `$(copilot) ${bar} pacing paused`;
   } else if (pacing.remainingToday > 0) {
     item.text = `$(copilot) ${bar} ~${Math.floor(pacing.remainingToday)} left today`;
   } else {
@@ -105,16 +115,15 @@ function renderClassicMode(
 ): void {
   const { totalUsage, limit } = data;
 
-  // Daily pacing progress from PacingResult (0–1, clamped)
   const dailyProgress = pacing.baseDailyBudget > 0
     ? Math.min(Math.max(0, (totalUsage - pacing.startOfTodayQuota) / pacing.baseDailyBudget), 1)
     : 0;
   const filledCount = Math.round(dailyProgress * 10);
   const emptyCount = 10 - filledCount;
-  const bar = '\u2588'.repeat(filledCount) + '\u2591'.repeat(emptyCount);
+  const bar = '█'.repeat(filledCount) + '░'.repeat(emptyCount);
 
   const actualPct = ((totalUsage / limit) * 100).toFixed(1);
-  const targetPct = Math.round((pacing.dayOfMonth / pacing.daysInMonth) * 100);
+  const targetPct = (pacing.targetPercentage * 100).toFixed(1);
 
   item.text = `$(copilot) [${bar}] ${actualPct}% / ${targetPct}%`;
 }
