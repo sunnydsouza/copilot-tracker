@@ -18,9 +18,33 @@ export interface PacingResult {
   startOfTodayQuota: number;
   endOfTodayQuota: number;
   remainingToday: number;
+  pacingMode: PacingMode;
+  pacingDay: number;
+  pacingDaysInMonth: number;
+  targetPercentage: number;
+  isWorkingDay: boolean;
 }
 
 export type UsageStatus = 'on-track' | 'over-budget' | 'ahead' | 'exhausted';
+export type PacingMode = 'calendar' | 'weekdays' | 'custom';
+
+export interface PacingOptions {
+  /** Calendar days (legacy), Mon-Fri weekdays, or a custom number of Mon-Fri workdays. */
+  mode?: PacingMode;
+  /** Intended number of workdays in the month. Used only in custom mode. */
+  workingDaysPerMonth?: number;
+  /** ISO dates (YYYY-MM-DD) that should not count as workdays. */
+  excludedDates?: string[];
+}
+
+interface PacingSchedule {
+  mode: PacingMode;
+  totalDays: number;
+  elapsedBeforeToday: number;
+  currentDay: number;
+  remainingDays: number;
+  isWorkingDay: boolean;
+}
 
 // Per-request overage price for Copilot premium requests, in USD. GitHub has
 // adjusted Copilot pricing in the past; if this changes, update here (and
@@ -31,27 +55,113 @@ export function getDaysInMonth(date: Date = new Date()): number {
   return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 0)).getUTCDate();
 }
 
+function toIsoDate(date: Date): string {
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(date.getUTCDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function normalizeExcludedDates(values: string[] | undefined): Set<string> {
+  const valid = (values ?? []).filter(v => /^\d{4}-\d{2}-\d{2}$/.test(v));
+  return new Set(valid);
+}
+
+function isWeekday(date: Date): boolean {
+  const day = date.getUTCDay();
+  return day >= 1 && day <= 5;
+}
+
+function isConfiguredWorkingDay(date: Date, excludedDates: Set<string>): boolean {
+  return isWeekday(date) && !excludedDates.has(toIsoDate(date));
+}
+
+/** Returns the Mon-Fri workdays in a month, optionally excluding ISO dates. */
+export function getWorkingDaysInMonth(date: Date = new Date(), excludedDates: string[] = []): number {
+  const excluded = normalizeExcludedDates(excludedDates);
+  const year = date.getUTCFullYear();
+  const month = date.getUTCMonth();
+  const days = getDaysInMonth(date);
+  let count = 0;
+
+  for (let day = 1; day <= days; day++) {
+    if (isConfiguredWorkingDay(new Date(Date.UTC(year, month, day)), excluded)) {
+      count++;
+    }
+  }
+  return count;
+}
+
+function getPacingSchedule(now: Date, options: PacingOptions): PacingSchedule {
+  const mode: PacingMode = options.mode ?? 'calendar';
+  const calendarDays = getDaysInMonth(now);
+  const calendarDay = now.getUTCDate();
+
+  if (mode === 'calendar') {
+    return {
+      mode,
+      totalDays: calendarDays,
+      elapsedBeforeToday: calendarDay - 1,
+      currentDay: calendarDay,
+      remainingDays: Math.max(1, calendarDays - calendarDay + 1),
+      isWorkingDay: true,
+    };
+  }
+
+  const excluded = normalizeExcludedDates(options.excludedDates);
+  const year = now.getUTCFullYear();
+  const month = now.getUTCMonth();
+  let elapsedBeforeToday = 0;
+
+  for (let day = 1; day < calendarDay; day++) {
+    if (isConfiguredWorkingDay(new Date(Date.UTC(year, month, day)), excluded)) {
+      elapsedBeforeToday++;
+    }
+  }
+
+  const isWorkingDay = isConfiguredWorkingDay(now, excluded);
+  const naturalWorkingDays = getWorkingDaysInMonth(now, options.excludedDates);
+  const configuredTotal = mode === 'custom'
+    ? Math.floor(options.workingDaysPerMonth ?? naturalWorkingDays)
+    : naturalWorkingDays;
+  const totalDays = Math.max(1, Math.min(31, configuredTotal));
+  const currentDay = Math.min(totalDays, elapsedBeforeToday + (isWorkingDay ? 1 : 0));
+  const elapsedForRemaining = Math.min(totalDays, elapsedBeforeToday);
+
+  return {
+    mode,
+    totalDays,
+    elapsedBeforeToday,
+    currentDay,
+    remainingDays: Math.max(1, totalDays - elapsedForRemaining),
+    isWorkingDay,
+  };
+}
+
 /**
  * Enhanced pacing calculation inspired by copilot_tracer_extension.
  *
- * Calculates daily-budget metrics: daily allowance, multiplier,
- * banked/overspent requests, projected end-of-month, and time-of-day
- * adjusted averages.
+ * By default this preserves the original calendar-day pacing. Pass
+ * `{ mode: 'weekdays' }` to pace across Mon-Fri, or `{ mode: 'custom',
+ * workingDaysPerMonth: 20 }` to divide the quota across a user-selected number
+ * of workdays. Weekends and excluded dates pause the daily budget.
  *
- * All date operations use UTC methods to ensure consistent pacing
- * regardless of the user's local timezone.
+ * All date operations use UTC methods to ensure consistent pacing regardless
+ * of the user's local timezone.
  */
 export function calculatePacing(
   usedRequests: number,
   monthlyLimit: number,
   now: Date = new Date(),
   remainingTotal?: number,
+  options: PacingOptions = {},
 ): PacingResult {
   const daysInMonth = getDaysInMonth(now);
   const dayOfMonth = now.getUTCDate();
-  const daysRemaining = Math.max(1, daysInMonth - dayOfMonth + 1);
+  const schedule = getPacingSchedule(now, options);
+  const daysRemaining = schedule.remainingDays;
 
-  const baseDailyBudget = monthlyLimit / daysInMonth;
+  const baseDailyBudget = monthlyLimit / schedule.totalDays;
   const remaining = remainingTotal !== undefined
     ? remainingTotal
     : Math.max(0, monthlyLimit - usedRequests);
@@ -60,30 +170,35 @@ export function calculatePacing(
   // Time-of-day progress (0.0 at midnight UTC, ~1.0 at end of day)
   const timeOfDayProgress = (now.getUTCHours() * 60 + now.getUTCMinutes()) / (24 * 60);
 
-  // Average daily usage (smoothly includes partial current day).
-  // Use a time-of-day-aware floor so day-1 at 00:05 UTC doesn't divide by 0.1
-  // and produce a 10x projection artifact. See CODE_REVIEW M1.
-  const effectiveDaysElapsed = Math.max(timeOfDayProgress, dayOfMonth - 1 + timeOfDayProgress);
+  // Working-day modes pause pacing on weekends/excluded dates. Calendar mode
+  // remains identical to the original behavior.
+  const effectiveDaysElapsed = Math.max(
+    schedule.isWorkingDay ? timeOfDayProgress : 0,
+    schedule.elapsedBeforeToday + (schedule.isWorkingDay ? timeOfDayProgress : 0),
+  );
   const avgDailyUsage = effectiveDaysElapsed > 0 ? usedRequests / effectiveDaysElapsed : 0;
 
-  // Expected usage by now (smooth intra-day)
+  // Expected usage by now (smooth intra-day on active pacing days).
   const expectedByNow = effectiveDaysElapsed * baseDailyBudget;
   const banked = expectedByNow - usedRequests; // positive = saved, negative = overspent
 
   const multiplier = baseDailyBudget > 0 ? dailyAllowance / baseDailyBudget : 1;
-  // `dayOfMonth` is always in [1, 31] (getUTCDate), so the prior ternary guard
-  // was unreachable. Suppress the projection while we have < ~1h of data to
-  // avoid wild extrapolations at the start of the month.
   const projectedEnd = effectiveDaysElapsed > 0.05
-    ? (usedRequests / effectiveDaysElapsed) * daysInMonth
+    ? (usedRequests / effectiveDaysElapsed) * schedule.totalDays
     : 0;
 
   const overageRequests = Math.max(0, usedRequests - monthlyLimit);
   const overageCost = overageRequests * COST_PER_PREMIUM_REQUEST;
 
-  const startOfTodayQuota = (dayOfMonth - 1) * baseDailyBudget;
-  const endOfTodayQuota = dayOfMonth * baseDailyBudget;
-  const remainingToday = Math.max(0, endOfTodayQuota - usedRequests);
+  const cappedElapsedBefore = Math.min(schedule.totalDays, schedule.elapsedBeforeToday);
+  const startOfTodayQuota = cappedElapsedBefore * baseDailyBudget;
+  const endOfTodayQuota = schedule.isWorkingDay
+    ? Math.min(monthlyLimit, (cappedElapsedBefore + 1) * baseDailyBudget)
+    : startOfTodayQuota;
+  const remainingToday = schedule.isWorkingDay
+    ? Math.max(0, endOfTodayQuota - usedRequests)
+    : 0;
+  const targetPercentage = Math.min(1, schedule.currentDay / schedule.totalDays);
 
   return {
     usedRequests,
@@ -105,6 +220,11 @@ export function calculatePacing(
     startOfTodayQuota,
     endOfTodayQuota,
     remainingToday,
+    pacingMode: schedule.mode,
+    pacingDay: schedule.currentDay,
+    pacingDaysInMonth: schedule.totalDays,
+    targetPercentage,
+    isWorkingDay: schedule.isWorkingDay,
   };
 }
 
@@ -113,10 +233,10 @@ export function getPacingProgress(usedRequests: number, limit: number): number {
   return limit > 0 ? usedRequests / limit : 0;
 }
 
-/** Returns the fraction of the month elapsed so far (UTC). */
-export function getRecommendedPercentage(now: Date = new Date()): number {
-  const daysInMonth = getDaysInMonth(now);
-  return now.getUTCDate() / daysInMonth;
+/** Returns the end-of-current-pacing-day target fraction (0–1). */
+export function getRecommendedPercentage(now: Date = new Date(), options: PacingOptions = {}): number {
+  const schedule = getPacingSchedule(now, options);
+  return Math.min(1, schedule.currentDay / schedule.totalDays);
 }
 
 /** Classify budget health based on daily pacing. */
@@ -129,22 +249,16 @@ export function classifyStatus(result: PacingResult): UsageStatus {
 }
 
 /**
- * Generates a ░█ pacer bar with a │ today-position marker.
+ * Generates a ░█ pacer bar with a │ target-position marker.
  *
- * Layout: `████│░░░░░░░` — █ = used portion, ░ = remaining, │ = today marker
- *
- * - When usage is below today's marker: gap of ░ between █ and │
- * - When usage is past today's marker: █ extends beyond │
- * - When over monthly limit: all █ past the marker, with overage cost shown separately
+ * Layout: `████│░░░░░░░` — █ = used portion, ░ = remaining, │ = target marker
  */
 export function generatePacerBar(pacing: PacingResult, width: number = 12): string {
-  const { usedRequests, monthlyLimit, dayOfMonth, daysInMonth } = pacing;
+  const { usedRequests, monthlyLimit, targetPercentage } = pacing;
 
   const usedRatio = Math.min(usedRequests / Math.max(1, monthlyLimit), 1);
-  const todayRatio = dayOfMonth / daysInMonth;
-
   const usedChars = Math.round(usedRatio * width);
-  const todayPos = Math.min(width - 1, Math.round(todayRatio * (width - 1)));
+  const todayPos = Math.min(width - 1, Math.round(targetPercentage * (width - 1)));
 
   let bar = '';
   for (let i = 0; i < width; i++) {
