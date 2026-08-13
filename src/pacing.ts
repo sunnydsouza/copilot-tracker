@@ -186,8 +186,12 @@ export function calculatePacing(
   );
   const avgDailyUsage = effectiveDaysElapsed > 0 ? usedRequests / effectiveDaysElapsed : 0;
 
-  // Expected usage by now (smooth intra-day on active pacing days).
-  const expectedByNow = effectiveDaysElapsed * baseDailyBudget;
+  // Calendar mode keeps the original smooth intra-day expectation. Working-day
+  // modes intentionally compare against the end-of-workday target (for example,
+  // workday 9 of 20 = 45%), which is the actionable target shown to the user.
+  const expectedByNow = schedule.mode === 'calendar'
+    ? effectiveDaysElapsed * baseDailyBudget
+    : schedule.currentDay * baseDailyBudget;
   const banked = expectedByNow - usedRequests; // positive = saved, negative = overspent
 
   const multiplier = baseDailyBudget > 0 ? dailyAllowance / baseDailyBudget : 1;
