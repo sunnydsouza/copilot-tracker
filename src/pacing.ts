@@ -46,6 +46,16 @@ interface PacingSchedule {
   isWorkingDay: boolean;
 }
 
+let defaultPacingOptions: PacingOptions = {};
+
+/** Sets the schedule used by callers that do not pass explicit pacing options. */
+export function setDefaultPacingOptions(options: PacingOptions): void {
+  defaultPacingOptions = {
+    ...options,
+    excludedDates: [...(options.excludedDates ?? [])],
+  };
+}
+
 // Per-request overage price for Copilot premium requests, in USD. GitHub has
 // adjusted Copilot pricing in the past; if this changes, update here (and
 // consider surfacing as a user setting). See CODE_REVIEW L3.
@@ -154,10 +164,8 @@ export function calculatePacing(
   monthlyLimit: number,
   now: Date = new Date(),
   remainingTotal?: number,
-  options: PacingOptions = {},
+  options: PacingOptions = defaultPacingOptions,
 ): PacingResult {
-  const daysInMonth = getDaysInMonth(now);
-  const dayOfMonth = now.getUTCDate();
   const schedule = getPacingSchedule(now, options);
   const daysRemaining = schedule.remainingDays;
 
@@ -204,8 +212,11 @@ export function calculatePacing(
     usedRequests,
     monthlyLimit,
     remaining,
-    dayOfMonth,
-    daysInMonth,
+    // These legacy fields intentionally represent the active pacing schedule.
+    // In calendar mode their values are unchanged; working-day modes therefore
+    // flow through the existing dashboard without duplicating UI logic.
+    dayOfMonth: schedule.currentDay,
+    daysInMonth: schedule.totalDays,
     daysRemaining,
     baseDailyBudget,
     dailyAllowance,
@@ -234,7 +245,7 @@ export function getPacingProgress(usedRequests: number, limit: number): number {
 }
 
 /** Returns the end-of-current-pacing-day target fraction (0–1). */
-export function getRecommendedPercentage(now: Date = new Date(), options: PacingOptions = {}): number {
+export function getRecommendedPercentage(now: Date = new Date(), options: PacingOptions = defaultPacingOptions): number {
   const schedule = getPacingSchedule(now, options);
   return Math.min(1, schedule.currentDay / schedule.totalDays);
 }
