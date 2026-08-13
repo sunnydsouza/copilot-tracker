@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { PacingMode, PacingOptions } from './pacing';
+import { PacingMode, PacingOptions, setDefaultPacingOptions } from './pacing';
 
 export function getPacingOptionsFromConfig(): PacingOptions {
   const config = vscode.workspace.getConfiguration('copilot-premium-tracker');
@@ -8,9 +8,14 @@ export function getPacingOptionsFromConfig(): PacingOptions {
   const workingDaysPerMonth = config.get<number>('customWorkingDays', 20);
   const excludedDates = config.get<string[]>('excludedDates', []);
 
-  return {
+  const options: PacingOptions = {
     mode,
     workingDaysPerMonth: mode === 'custom' ? workingDaysPerMonth : undefined,
     excludedDates,
   };
+
+  // Status-bar rendering happens before/alongside dashboard rendering and keeps
+  // the shared pacing engine aligned with the current VS Code configuration.
+  setDefaultPacingOptions(options);
+  return options;
 }
